@@ -1,0 +1,319 @@
+import os
+import sys
+import pickle
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.multiclass import OneVsOneClassifier, OneVsRestClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.base import BaseEstimator, TransformerMixin
+import time
+# =========================================================================
+# GESTION DYNAMIQUE DES CHEMINS & IMPORTS INTER-DOSSIERS
+# =========================================================================
+start_time = time.time()
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+# On ajoute le dossier racine et le dossier 'code' pour localiser le Script 01
+sys.path.append(PARENT_DIR)
+sys.path.append(os.path.join(PARENT_DIR, "code"))
+
+# Import direct et sécurisé depuis le dossier 'code'
+try:
+    from Script01_PreprocessingExploration import compute_hog, my_PCA, TARGET_SIZE
+except ImportError:
+    # Safe defaults uniquement si la structure est absente
+    TARGET_SIZE = (64, 64)
+    def my_PCA(data, n_components=5): pass
+    def compute_hog(image, nb_h_cells, nb_w_cells, nb_bins): return np.zeros(nb_h_cells*nb_w_cells*nb_bins)
+
+# Définition de la fonction load_dict pour charger proprement le dictionnaire sérialisé
+def load_dict(f):
+    if os.path.exists(f):
+        with open(f, "rb") as file:
+            return pickle.load(file)
+    return {0: 'Chihuahua', 1: 'Pug', 2: 'Malamute', 3: 'Beagle'}
+
+OUTPUT_DIR = os.path.join(CURRENT_DIR)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# Chargement des matrices .npy stockées à la racine (PARENT_DIR)
+X_TRAIN_PATH = os.path.join(PARENT_DIR, "X_train_standard.npy")
+if os.path.exists(X_TRAIN_PATH):
+    X_train = np.load(os.path.join(PARENT_DIR, "X_train_standard.npy"))
+    X_test = np.load(os.path.join(PARENT_DIR, "X_test_standard.npy"))
+    y_train = np.load(os.path.join(PARENT_DIR, "y_train_standard.npy"))
+    y_test = np.load(os.path.join(PARENT_DIR, "y_test_standard.npy"))
+    label_names = load_dict(os.path.join(PARENT_DIR, "lbl_names.npy"))
+    labels = np.load(os.path.join(PARENT_DIR, "labels.npy"))
+else:
+    raise FileNotFoundError(f"Cache arrays not found at root path: {PARENT_DIR}. Run Lab 1 script first.")
+
+
+# =========================================================================
+# TASK 1: QUANTIFYING TRAIN/TEST DISTRIBUTION RESEMBLANCE 
+# =========================================================================
+# Prevent the "Time Machine Effect". We must ensure our random splits 
+# have similar class distributions before applying any transformations.
+
+### STUDENT IMPLEMENTATION START ###
+# TODO: 1. Calculate the empirical distribution arrays (class probabilities) for y_train and y_test.
+#          Hint: Use np.unique(..., return_counts=True) and divide by the total length.
+unique_train, counts_train = np.unique(y_train, return_counts=True)
+unique_test, counts_test = np.unique(y_test, return_counts=True)
+
+P_train = counts_train / np.sum(counts_train)
+P_test = counts_test / np.sum(counts_test)
+
+# TODO: 2. Implement the Cosine Similarity metric to quantify the resemblance:
+#          Formula: (A dot B) / (norm(A) * norm(B))
+dot_product = np.dot(P_train, P_test)
+norm_train = np.linalg.norm(P_train)
+norm_test = np.linalg.norm(P_test)
+
+similarity_score = dot_product / (norm_train * norm_test)
+
+# 3. GÉNÉRATION DE L'HISTOGRAMME À PLAT DÉPENDANT DES CLASSES
+# Extraction dynamique des noms de classes présents pour éviter tout problème de dimension (shape mismatch)
+class_names = [label_names[c] if c in label_names else f"Class {c}" for c in unique_train]
+
+x = np.arange(len(class_names))  
+width = 0.35  
+
+fig, ax = plt.subplots(figsize=(8, 4.5))
+rects1 = ax.bar(x - width/2, P_train * 100, width, label='Train Distribution', color='#2e75b6', edgecolor='black')
+rects2 = ax.bar(x + width/2, P_test * 100, width, label='Test Distribution', color='#c00000', edgecolor='black')
+
+# Personnalisation des axes
+ax.set_ylabel('Proportion au sein du Subset (%)', fontweight='bold')
+ax.set_title('Comparaison de la distribution des classes (Train vs Test)', fontweight='bold', fontsize=12)
+ax.set_xticks(x)
+ax.set_xticklabels(class_names, rotation=15, ha='right')
+ax.set_ylim(0, max(max(P_train), max(P_test)) * 100 + 10)
+ax.legend()
+ax.grid(axis='y', linestyle='--', alpha=0.5)
+
+fig_path_balance = os.path.join(OUTPUT_DIR, 'train_test_class_balance.png')
+plt.savefig(fig_path_balance, bbox_inches='tight', dpi=150)
+plt.show()
+
+### STUDENT IMPLEMENTATION END ###
+print(f"   - Train/Test Resemblance (Cosine Similarity): {similarity_score:.6f}")
+
+
+# =========================================================================
+# TASK 2: CUSTOM PIPELINE TRANSFORMER WRAPPERS 
+# =========================================================================
+class EdgeInfoPreprocessing(BaseEstimator, TransformerMixin):
+    def __init__(self, nb_h_cells=4, nb_w_cells=4, nb_bins=8):
+        self.nb_h_cells = nb_h_cells
+        self.nb_w_cells = nb_w_cells
+        self.nb_bins = nb_bins
+        
+    def fit(self, X, y=None):
+        return self 
+        
+    def transform(self, X):
+        return np.array([compute_hog(img.reshape(TARGET_SIZE), self.nb_h_cells, self.nb_w_cells, self.nb_bins) for img in X])
+
+
+class PCAInfoPreprocessing(BaseEstimator, TransformerMixin):
+    def __init__(self, n_components=5):
+        self.n_components = n_components
+        self.pca_per_class = []
+        
+    def fit(self, X, y=None):
+        if y is None:
+            raise ValueError("Supervised target array 'y' is required to fit class-specific subspaces.")
+        
+        ### STUDENT IMPLEMENTATION START ###
+        # TODO: 1. Clear historical instances tracked in self.pca_per_class.
+        # TODO: 2. Iterate through unique class identifiers present within vector 'y'.
+        # TODO: 3. Isolate matching instance data slices from 'X', train separate PCA models,
+        #          and append each fitted model to self.pca_per_class.
+        self.pca_per_class = []
+        unique_classes = np.unique(y)
+        
+        for c in sorted(unique_classes):
+            class_subset = X[y == c]
+            n_samples = class_subset.shape[0]
+            actual_components = min(self.n_components, n_samples)
+            
+            fitted_pca = my_PCA(class_subset, n_components=actual_components)
+            
+            if fitted_pca is None:
+                from sklearn.decomposition import PCA as SkPCA
+                fitted_pca = SkPCA(n_components=actual_components).fit(class_subset)
+                
+            self.pca_per_class.append(fitted_pca)
+        
+        ### STUDENT IMPLEMENTATION END ###
+        return self
+        
+    def transform(self, X):
+        out = np.zeros((len(X), 0))
+        
+        ### STUDENT IMPLEMENTATION START ###
+        # TODO: 1. Iterate through the fitted PCA models saved in self.pca_per_class.
+        # TODO: 2. Transform the input matrix 'X' using each PCA model.
+        # TODO: 3. Horizontally stack the outputs together using np.hstack.
+        outputs_list = []
+        for pca_model in self.pca_per_class:
+            proj = pca_model.transform(X)
+            features = proj[:, :min(proj.shape[1], self.n_components)]
+            outputs_list.append(features)
+            
+        if outputs_list:
+            out = np.hstack(outputs_list)
+        
+        ### STUDENT IMPLEMENTATION END ###
+        return out
+
+
+# =========================================================================
+# TASK 3: END-TO-END AUTOMATED PIPELINE ARCHITECTURES (See Slide 5)
+# =========================================================================
+print("\n Step 2: Assembling automated Pipeline and FeatureUnion components...")
+
+### STUDENT IMPLEMENTATION START ###
+# TODO: 1. Construct a 'FeatureUnion' merging 'PCAInfoPreprocessing' and 'EdgeInfoPreprocessing'.
+#          Name it 'all_features'.
+all_features = FeatureUnion([
+    ('pca_class', PCAInfoPreprocessing()),
+    ('hog_edges', EdgeInfoPreprocessing())
+])
+
+# TODO: 2. Build the end-to-end processing pipeline using scikit-learn's 'Pipeline' class.
+#          The sequence MUST be: MinMaxScaler -> FeatureUnion -> StandardScaler -> SVC(kernel='linear').
+#          Name it 'pipeline_svc'.
+pipeline_svc = Pipeline([
+    ('minmax', MinMaxScaler()),
+    ('features', all_features),
+    ('scaler', StandardScaler()),
+    ('classifier', SVC(kernel='linear'))
+])
+### STUDENT IMPLEMENTATION END ###
+
+
+# =========================================================================
+# TASK 4: HYPERPARAMETER OPTIMIZATION SELECTION SPACE & DIAGNOSTICS
+# =========================================================================
+print("\n Step 3: Tuning via GridSearchCV...")
+
+if pipeline_svc is not None:
+    pipeline_svc.set_params(classifier__kernel='rbf')
+    
+    ### STUDENT IMPLEMENTATION START ###
+    param_grid = {
+        'features__pca_class__n_components': [5, 10],
+        'classifier__C': [0.1, 1, 10],
+        'classifier__gamma': [0.01, 0.1]
+    }
+    ### STUDENT IMPLEMENTATION END ###
+    
+    grid_search = GridSearchCV(pipeline_svc, param_grid=param_grid, cv=3, n_jobs=-1)
+    
+    print("   Training the Grid Search ")
+    grid_search.fit(X_train, y_train)
+    print(f"    Optimal Parameters Identified: {grid_search.best_params_}")
+    print(f"    Generalization Score on Testing Partition: {grid_search.score(X_test, y_test)*100:.2f}%")
+
+    results_df = pd.DataFrame(grid_search.cv_results_)
+    print("\n   === HISTORIQUE COMPLET DE LA GRILLE ===")
+    print(results_df[['param_features__pca_class__n_components', 
+                       'param_classifier__C', 
+                       'param_classifier__gamma', 
+                       'mean_test_score']])
+
+    # --- AJOUT DE LA MATRICE DE CONFUSION (DÉPENDANTE DE LA TASK 4) ---
+    print("\n Génération de la Matrice de Confusion...")
+    y_pred_grid = grid_search.predict(X_test)
+    cm_grid = confusion_matrix(y_test, y_pred_grid)
+    display_labels = [label_names[i] for i in sorted(label_names.keys())]
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm_grid, display_labels=display_labels)
+    disp.plot(cmap='Blues', ax=ax, xticks_rotation=20)
+    ax.set_title("Matrice de Confusion - Modèle RBF Optimisé", fontweight='bold', pad=15)
+
+    fig_path_cm = os.path.join(OUTPUT_DIR, 'confusion_matrix_gridsearch.png')
+    plt.savefig(fig_path_cm, bbox_inches='tight', dpi=150)
+    plt.show()
+    print(f"   -> Matrice de confusion sauvegardée avec succès : {fig_path_cm}")
+
+
+# =========================================================================
+# TASK 5: MULTICLASS STRATEGY COMPARISON & CONFUSION MATRICES
+# =========================================================================
+print("\n Step 4: Comparing  OvO vs. OvR ")
+
+### STUDENT IMPLEMENTATION START ###
+# 1. Pipeline avec la stratégie One-vs-One (OvO)
+pipeline_ovo = Pipeline([
+    ('minmax', MinMaxScaler()),
+    ('features', all_features),
+    ('scaler', StandardScaler()),
+    ('classifier', OneVsOneClassifier(SVC(kernel='linear')))
+])
+pipeline_ovo.fit(X_train, y_train)
+ovo_score = pipeline_ovo.score(X_test, y_test)
+
+# 2. Pipeline avec la stratégie One-vs-Rest (OvR)
+pipeline_ovr = Pipeline([
+    ('minmax', MinMaxScaler()),
+    ('features', all_features),
+    ('scaler', StandardScaler()),
+    ('classifier', OneVsRestClassifier(SVC(kernel='linear')))
+])
+pipeline_ovr.fit(X_train, y_train)
+ovr_score = pipeline_ovr.score(X_test, y_test)
+### STUDENT IMPLEMENTATION END ###
+
+print(f"   One-vs-One (OvO) Strategy Score: {ovo_score*100:.2f}%")
+print(f"   One-vs-Rest (OvR) Strategy Score: {ovr_score*100:.2f}%")
+
+
+# =========================================================================
+# GENERATION DES MATRICES DE CONFUSION : OVO PUIS OVR
+# =========================================================================
+print("\n Génération des Matrices de Confusion Comparatives...")
+display_labels = [label_names[i] for i in sorted(label_names.keys())]
+
+# --- 1. MATRICE DE CONFUSION POUR OVO ---
+y_pred_ovo = pipeline_ovo.predict(X_test)
+cm_ovo = confusion_matrix(y_test, y_pred_ovo)
+
+fig, ax = plt.subplots(figsize=(6, 6))
+disp_ovo = ConfusionMatrixDisplay(confusion_matrix=cm_ovo, display_labels=display_labels)
+disp_ovo.plot(cmap='Reds', ax=ax, xticks_rotation=20)
+ax.set_title("Matrice de Confusion - Stratégie OvO (One-vs-One)", fontweight='bold', pad=15)
+
+fig_path_ovo = os.path.join(OUTPUT_DIR, 'confusion_matrix_ovo.png')
+plt.savefig(fig_path_ovo, bbox_inches='tight', dpi=150)
+plt.show()
+print(f"   -> Matrice OvO sauvegardée : {fig_path_ovo}")
+
+
+# --- 2. MATRICE DE CONFUSION POUR OVR ---
+y_pred_ovr = pipeline_ovr.predict(X_test)
+cm_ovr = confusion_matrix(y_test, y_pred_ovr)
+
+fig, ax = plt.subplots(figsize=(6, 6))
+disp_ovr = ConfusionMatrixDisplay(confusion_matrix=cm_ovr, display_labels=display_labels)
+disp_ovr.plot(cmap='Greens', ax=ax, xticks_rotation=20)
+ax.set_title("Matrice de Confusion - Stratégie OvR (One-vs-Rest)", fontweight='bold', pad=15)
+
+fig_path_ovr = os.path.join(OUTPUT_DIR, 'confusion_matrix_ovr.png')
+plt.savefig(fig_path_ovr, bbox_inches='tight', dpi=150)
+plt.show()
+print(f"   -> Matrice OvR sauvegardée : {fig_path_ovr}")
+end_time = time.time()
+execution_time = end_time - start_time
+print(f"\n Durée totale d'exécution du script : {execution_time:.2f} secondes")
